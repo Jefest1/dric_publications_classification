@@ -42,15 +42,25 @@ _FIRECRAWL_MIN_INTERVAL = 2
 _LAST_GROQ_CALL: float | None = None
 _GROQ_MIN_INTERVAL = 1 
 
-llm = ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0, api_key=settings.GROQ_API_KEY)
+llm = ChatGroq(model="meta-llama/llama-4-maverick-17b-128e-instruct", temperature=0, api_key=settings.GROQ_API_KEY)
 
 
-PROMPT_TEMPLATE = (
-    "Answer YES or NO only. Does the following text acknowledge funding or support from "
-    "the Directorate of Research Innovation and Consultancy (DRIC) of the University of Cape Coast"
-    "Look for phrases like 'Directorate of Research Innovation and Consultancy', or 'DRIC'"
-    "\n\n{text}"
-)
+PROMPT_TEMPLATE = """
+You are a text classifier. Your task is to decide whether the text below explicitly acknowledges financial or material support from the Directorate of Research, Innovation and Consultancy (DRIC) of the University of Cape Coast.
+
+Reply strictly with YES or NO (uppercase), nothing else.
+
+Reply YES only if BOTH of the following are true:
+• The text contains a funding or acknowledgement statement, AND
+• That statement clearly attributes funding, sponsorship, grant, or other support to DRIC (or "Directorate of Research Innovation and Consultancy") of the University of Cape Coast.
+
+Reply NO in all other cases, including when:
+• DRIC is mentioned but not in a funding/support context,
+• DRIC refers to some other organisation,
+• No funding acknowledgement is present.
+
+{text}
+"""
 
 
 async def _extract_article_url(ctx, scholar_url: str) -> str | None:
@@ -285,7 +295,7 @@ async def _process_row(ctx, row: pd.Series) -> dict:
     }
 
 
-async def process_period_async(period: str):
+async def process_period_async(period: str, start_row: int = 0):
     logging.info(f"Processing period {period}")
     raw_file = Path("Data") / period / "raw_publications.csv"
     if not raw_file.exists():
@@ -297,6 +307,20 @@ async def process_period_async(period: str):
 
     df_in = pd.read_csv(raw_file)
     logging.info(f"Loaded {len(df_in)} publication records")
+
+    # If resuming from a specific row, keep previously computed results and slice input.
+    prev_rows: pd.DataFrame
+    if start_row > 0:
+        if out_file.exists():
+            prev_rows = pd.read_csv(out_file).iloc[:start_row]
+            logging.info(f"Resuming from row {start_row}. Preserving {len(prev_rows)} existing result rows")
+        else:
+            prev_rows = pd.DataFrame()
+            logging.warning("start_row provided but existing output file not found; proceeding without preserved rows")
+        df_in = df_in.iloc[start_row:]
+    else:
+        prev_rows = pd.DataFrame()
+
 
     async with async_playwright() as pw:
         browser: Browser = await pw.chromium.launch(headless=True, args=["--disable-gl-drawing-for-tests", "--no-sandbox"])
@@ -318,14 +342,20 @@ async def process_period_async(period: str):
     df_out = pd.DataFrame(results)
     if "scholar_link" in df_out.columns:
         df_out = df_out.drop(columns=["scholar_link"])
+
+    # Combine with any previously preserved rows
+    if not prev_rows.empty:
+        df_out = pd.concat([prev_rows, df_out], ignore_index=True)
+
     df_out.to_csv(out_file, index=False)
-    logging.info(f"Saved results -> {out_file}")
+    logging.info(f"Saved results -> {out_file} (total rows: {len(df_out)})")
 
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--period", required=True, help="Academic year string e.g. 2016-2017 or 2020")
+    parser.add_argument("--start-row", type=int, default=0, help="Row index to resume from (0 = start)")
     args = parser.parse_args()
 
-    asyncio.run(process_period_async(args.period)) 
+    asyncio.run(process_period_async(args.period, start_row=args.start_row)) 
